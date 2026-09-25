@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>SkyFlip 3D</title>
+  <meta name="description" content="A tiny 3D backflip game. Jump off taller and taller towers, flip, land, earn coins and unlock skins and tricks.">
+  <meta name="theme-color" content="#1d4ed8">
+
+  <!-- iOS: lets it run full screen like an app after "Add to Home Screen" -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="SkyFlip">
+  <meta name="format-detection" content="telephone=no">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <!-- Full-screen touch area: hold anywhere to jump and flip -->
+  <div id="touch"></div>
+
+  <!-- In-game HUD -->
+  <div id="hud" class="hidden">
+    <div class="topbar">
+      <button id="btn-pause" class="icon-btn" aria-label="Menu">❚❚</button>
+      <div class="level-info">
+        <div id="hud-level">Lv 1 · Backyard</div>
+        <div id="hud-goal">Goal: 1 flip</div>
+      </div>
+      <div class="coins-pill"><span class="coin-icon"></span><span id="hud-coins">0</span></div>
+    </div>
+    <div id="streak" class="hidden">🔥 Streak x2</div>
+    <div id="altimeter" class="hidden">
+      <div class="alt-bar"><div id="alt-marker"></div></div>
+      <div id="alt-text">0 m</div>
+    </div>
+    <div id="flip-counter"></div>
+    <div id="hint">Hold to jump &amp; flip!<small>Let go to stop spinning · land on your feet</small></div>
+    <div id="toast"></div>
+  </div>
+
+  <!-- Main menu -->
+  <div id="menu" class="screen">
+    <div class="menu-top">
+      <div class="coins-pill"><span class="coin-icon"></span><span class="coin-count">0</span></div>
+      <button id="btn-sound" class="icon-btn" aria-label="Sound">🔊</button>
+    </div>
+    <div class="logo">
+      <h1>Sky<span>Flip</span></h1>
+      <p>3D backflip tower</p>
+    </div>
+    <div class="menu-bottom">
+      <div class="menu-buttons">
+        <button id="btn-play" class="big-btn play">▶ PLAY</button>
+        <div class="row">
+          <button id="btn-levels" class="big-btn blue">🗼 Levels</button>
+          <button id="btn-store" class="big-btn purple">🛒 Store</button>
+        </div>
+      </div>
+      <p id="ios-tip" class="hidden">On iPhone: tap <b>Share</b> → <b>Add to Home Screen</b> to play full screen like an app!</p>
+    </div>
+  </div>
+
+  <!-- Level select -->
+  <div id="levels" class="screen hidden">
+    <div class="screen-head">
+      <button class="icon-btn back" data-back>‹</button>
+      <h2>Levels</h2>
+      <div class="coins-pill"><span class="coin-icon"></span><span class="coin-count">0</span></div>
+    </div>
+    <div id="level-grid" class="grid"></div>
+  </div>
+
+  <!-- Store -->
+  <div id="store" class="screen hidden">
+    <div class="screen-head">
+      <button class="icon-btn back" data-back>‹</button>
+      <h2>Store</h2>
+      <div class="coins-pill"><span class="coin-icon"></span><span class="coin-count">0</span></div>
+    </div>
+    <div class="store-panel">
+      <div class="tabs">
+        <button class="tab active" data-tab="skins">Skins</button>
+        <button class="tab" data-tab="tricks">Tricks</button>
+      </div>
+      <div id="store-grid" class="grid store-grid"></div>
+      <div class="store-action">
+        <div id="store-desc"></div>
+        <button id="btn-buy" class="big-btn play">Equip</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Level complete -->
+  <div id="complete" class="screen modal hidden">
+    <div class="card">
+      <h2 id="complete-title">LEVEL COMPLETE!</h2>
+      <div id="complete-stars" class="stars">★★★</div>
+      <div id="complete-lines"></div>
+      <div class="row">
+        <button id="btn-replay" class="big-btn blue">↻ Replay</button>
+        <button id="btn-next" class="big-btn play">Next ▶</button>
+      </div>
+      <button id="btn-complete-store" class="link-btn">🛒 Visit the store</button>
+    </div>
+  </div>
+
+  <div id="loading">Loading…</div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
