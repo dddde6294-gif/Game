@@ -1,32 +1,58 @@
 import * as THREE from '../vendor/three.module.min.js';
-import { LEVELS, THEMES, SKINS, TRICKS, FLIP_NAMES } from './data.js';
-import { Character, HIP_HEIGHT } from './character.js';
-import { World, MAT_TOP } from './world.js';
+import { THEMES, WORLDS, SKINS, FLIPS, TRICKS, MAX_BUTTONS, FLIP_NAMES } from './data.js';
+import { LEVELS } from './levels.js';
+import { STEP, HIP_HEIGHT, MAT_TOP, START_X, SPIN_TIME, levelPhysics, fallStep, simulate } from './physics.js';
+import { Character, trickPose } from './character.js';
+import { World } from './world.js';
 import { initAudio, setSoundEnabled, setWind, sfx } from './audio.js';
 
 const TAU = Math.PI * 2;
-const STEP = 1 / 120;                 // fixed physics step (keeps jumps identical every time)
-const PHYS = { gravity: 14, jump: 7, vx: 2.6, terminal: 22 };
-const SPIN = TAU / 0.72;              // one backflip every 0.72s while holding
-const LAND_TOL = 0.72;                // ~41° from upright still counts as a landing
-const PERFECT_TOL = 0.2;              // ~11° = perfect landing
-const START_X = -0.45;                // where you stand on the tower (edge is x = 0)
+const SPIN = TAU / SPIN_TIME;           // spin speed of a basic flip
+const LAND_TOL = 0.72;                  // ~41° from upright still counts as a landing
+const PERFECT_TOL = 0.2;                // ~11° = perfect landing
+const levelBonus = (i) => 1 + i * 0.4;  // later levels pay more coins
+const byId = (list, id) => list.find((x) => x.id === id) || list[0];
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const ease = (p) => (p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2);
 
 // ---------- Save data (stored on this device) ----------
 const SAVE_KEY = 'skyflip-save-v1';
-const save = Object.assign(
-  { coins: 0, skins: ['rookie'], tricks: ['backflip'], skin: 'rookie', trick: 'backflip',
-    unlocked: 1, level: 0, best: {}, cleared: {}, sound: true },
-  loadSave(),
-);
+const save = loadSave();
+
 function loadSave() {
-  try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch { return {}; }
+  let raw = {};
+  try { raw = JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch { /* private mode */ }
+  if (raw.v !== 2) {
+    // the first version called flip styles "tricks"
+    raw.flips = raw.tricks;
+    raw.flip = raw.trick;
+    delete raw.tricks;
+    delete raw.trick;
+  }
+  const owned = (list, ids, first) => {
+    const out = (Array.isArray(ids) ? ids : []).filter((id, i, a) => a.indexOf(id) === i && list.some((x) => x.id === id));
+    if (!out.includes(first)) out.unshift(first);
+    return out;
+  };
+  const s = { sound: true, ...raw, v: 2 };
+  s.skins = owned(SKINS, raw.skins, 'rookie');
+  s.flips = owned(FLIPS, raw.flips, 'backflip');
+  s.tricks = owned(TRICKS, raw.tricks, 'superman');
+  s.buttons = (Array.isArray(raw.buttons) ? raw.buttons : ['superman']).filter((id) => s.tricks.includes(id)).slice(0, MAX_BUTTONS);
+  if (!s.buttons.length) s.buttons = [s.tricks[0]];
+  if (!s.skins.includes(s.skin)) s.skin = 'rookie';
+  if (!s.flips.includes(s.flip)) s.flip = 'backflip';
+  s.best = raw.best || {};
+  s.cleared = raw.cleared || {};
+  s.perfect = raw.perfect || {};
+  s.coins = Math.max(0, Math.floor(Number(raw.coins) || 0));
+  s.unlocked = Math.min(LEVELS.length, Math.max(1, Math.floor(Number(raw.unlocked) || 1)));
+  s.level = Math.min(s.unlocked - 1, Math.max(0, Math.floor(Number(raw.level) || 0)));
+  return s;
 }
 function persist() {
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch { /* private mode */ }
 }
-const skinById = (id) => SKINS.find((s) => s.id === id) || SKINS[0];
-const trickById = (id) => TRICKS.find((t) => t.id === id) || TRICKS[0];
 
 // ---------- Three.js setup ----------
 const canvas = document.getElementById('game');
@@ -51,7 +77,7 @@ resize();
 const world = new World(scene);
 const hero = new Character();
 scene.add(hero.root);
-hero.applySkin(skinById(save.skin));
+hero.applySkin(byId(SKINS, save.skin));
 
 // Blob shadow under the player (helps you time the landing)
 const shadowTex = (() => {
@@ -128,16 +154,21 @@ function confetti(x, y) {
     emit(tmpV.set(x, y, 0), colors[i % colors.length], { vel: new THREE.Vector3((Math.random() - 0.5) * 7, 5 + Math.random() * 6, (Math.random() - 0.5) * 7), spread: 1, life: 1.8, grav: 9, size: 0.9 });
   }
 }
+function sparkle(pos, color, n = 8) {
+  for (let i = 0; i < n; i++) emit(pos, color, { spread: 4, life: 0.45, size: 0.7 });
+}
 
 // ---------- Game state ----------
 const G = {
   state: 'menu',          // menu | store | intro | ready | air | landed | crashed
-  levelIndex: 0, level: LEVELS[0], theme: THEMES.backyard, phys: PHYS, info: null,
-  x: START_X, y: 0, vx: 0, vy: 0, angle: 0, omega: 0, trick: TRICKS[0],
+  levelIndex: 0, level: LEVELS[0], theme: THEMES.backyard, phys: levelPhysics(LEVELS[0]), info: null,
+  x: START_X, y: 0, vx: 0, vy: 0, angle: 0, omega: 0,
+  flipStyle: FLIPS[0], dir: 1,
+  move: null, movesDone: [], moveCoins: 0, extraTwist: 0,   // button tricks in this jump
   t: 0, stateTime: 0, flipsShown: 0, airCoins: 0, streak: 0,
   angleTarget: 0, twistTarget: 0, restY: 0, landedFlips: 0,
   panel: false, trailTimer: 0, shake: 0, introDur: 1, acc: 0,
-  demo: { active: false, t: 0, dur: 1, trick: TRICKS[0] }, demoTimer: 0,
+  demo: { active: false, t: 0, dur: 1, kind: 'flip', item: FLIPS[0] }, demoTimer: 0,
 };
 const pointers = new Set();
 let holding = false;
@@ -147,45 +178,30 @@ const camLook = new THREE.Vector3(0, 3, 0);
 const wantPos = new THREE.Vector3();
 const wantLook = new THREE.Vector3();
 
-// Runs the same physics as the game to find how long a jump lasts and where it lands.
-function simulate(phys, fromY, onStep) {
-  let x = START_X, y = fromY, vy = phys.jump, t = 0;
-  while (t < 60) {
-    vy = Math.max(vy - phys.gravity * STEP, -phys.terminal);
-    x += phys.vx * STEP;
-    y += vy * STEP;
-    t += STEP;
-    if (onStep) onStep(t, x, y);
-    if (y - HIP_HEIGHT <= MAT_TOP && vy < 0) break;
-  }
-  return { t, x };
-}
-
 function setState(s) {
   G.state = s;
   G.stateTime = 0;
   el.hint.classList.toggle('hidden', s !== 'ready');
   el.altimeter.classList.toggle('hidden', !(s === 'ready' || s === 'air'));
+  updateTrickButtons();
 }
 
 function startLevel(i, { intro = true } = {}) {
   G.levelIndex = i;
   G.level = LEVELS[i];
   G.theme = THEMES[G.level.theme];
-  G.phys = {
-    ...PHYS,
-    gravity: G.level.gravity ?? PHYS.gravity,
-    jump: G.level.jump ?? PHYS.jump,
-    terminal: G.level.terminal ?? PHYS.terminal,
-  };
+  G.phys = levelPhysics(G.level);
   const top = G.level.height;
-  const land = simulate(G.phys, top + HIP_HEIGHT);
+  const land = simulate(G.phys, top);
   G.info = world.build(G.level, G.theme, land.x, i + 1);
+  camera.far = Math.max(2600, G.info.viewDistance);
+  camera.updateProjectionMatrix();
   document.body.style.background = G.theme.skyBottom;
   spawnCoins(top);
   save.level = i;
   persist();
   G.streak = 0;
+  updateStreak();
   placeOnTower();
   updateHud();
   if (intro) {
@@ -199,7 +215,7 @@ function spawnCoins(top) {
   for (const c of coins) scene.remove(c.mesh);
   coins = [];
   const path = [];
-  const land = simulate(G.phys, top + HIP_HEIGHT, (t, x, y) => path.push({ t, x, y }));
+  const land = simulate(G.phys, top, (t, x, y) => path.push({ x, y }));
   const n = Math.min(3 + G.levelIndex, 14);
   const value = 1 + Math.floor(G.levelIndex / 2);
   for (let k = 0; k < n; k++) {
@@ -228,9 +244,12 @@ function placeOnTower() {
   G.vx = G.vy = 0;
   G.angle = 0;
   G.omega = 0;
+  G.move = null;
+  G.extraTwist = 0;
   hero.flip.rotation.z = 0;
   hero.twist.rotation.y = 0;
   hero.snapPose('stand');
+  hero.setWind(0);
   resetCoins();
   el.flip.className = '';
   el.flip.style.opacity = 0;
@@ -265,15 +284,19 @@ touchLayer.addEventListener('touchstart', (e) => e.preventDefault(), { passive: 
 touchLayer.addEventListener('touchend', () => initAudio());
 document.addEventListener('gesturestart', (e) => e.preventDefault());
 document.addEventListener('dblclick', (e) => e.preventDefault());
+const PLAYING = ['intro', 'ready', 'air', 'landed', 'crashed'];
+const HOLD_KEYS = ['Space', 'ArrowUp', 'KeyW', 'Enter'];
 window.addEventListener('keydown', (e) => {
-  if (e.repeat || !['Space', 'ArrowUp', 'KeyW', 'Enter'].includes(e.code)) return;
-  if (!['intro', 'ready', 'air', 'landed', 'crashed'].includes(G.state)) return;
+  if (e.repeat || !PLAYING.includes(G.state) || G.panel) return;
+  const slot = ['Digit1', 'Digit2', 'Digit3', 'Digit4'].indexOf(e.code);
+  if (slot >= 0) { doTrick(slot); return; }
+  if (!HOLD_KEYS.includes(e.code)) return;
   e.preventDefault();
   pointers.add('key');
   press();
 });
 window.addEventListener('keyup', (e) => {
-  if (!['Space', 'ArrowUp', 'KeyW', 'Enter'].includes(e.code)) return;
+  if (!HOLD_KEYS.includes(e.code)) return;
   pointers.delete('key');
   release();
 });
@@ -281,9 +304,10 @@ function dropInput() { pointers.clear(); holding = false; setWind(0); }
 window.addEventListener('blur', dropInput);
 document.addEventListener('visibilitychange', () => { if (document.hidden) dropInput(); });
 
-// ---------- Jumping, flipping, landing ----------
+// ---------- Jumping, flipping, tricks, landing ----------
 function jump() {
-  G.trick = trickById(save.trick);
+  G.flipStyle = byId(FLIPS, save.flip);
+  G.dir = G.flipStyle.dir || 1;
   G.vx = G.phys.vx;
   G.vy = G.phys.jump;
   G.angle = 0;
@@ -291,21 +315,70 @@ function jump() {
   G.flipsShown = 0;
   G.airCoins = 0;
   G.acc = 0;
+  G.move = null;
+  G.movesDone = [];
+  G.moveCoins = 0;
+  G.extraTwist = 0;
   setState('air');
   hero.setPose('launch', 20);
   sfx.jump();
   dust(G.x, G.level.height, 8);
 }
 
+// A trick button was pressed (slot 0-3). On the tower it also jumps.
+function doTrick(slot) {
+  initAudio();
+  const id = save.buttons[slot];
+  if (!id) return;
+  if (G.state === 'ready') jump();
+  if (G.state !== 'air') return;
+  const btn = el.tricks.children[slot];
+  if (G.move) {
+    if (btn) { btn.classList.remove('nope'); void btn.offsetWidth; btn.classList.add('nope'); }
+    return;
+  }
+  G.move = { def: byId(TRICKS, id), t: 0, slot };
+  sfx.trick();
+  updateTrickButtons();
+}
+
+function finishTrick() {
+  const def = G.move.def;
+  G.movesDone.push(def.id);
+  G.moveCoins += def.coins;
+  G.extraTwist += (def.turns || 0) * TAU;
+  G.move = null;
+  sfx.trickDone(G.movesDone.length);
+  sparkle(hero.root.position, '#fde047', 10);
+  el.trickPop.textContent = `${def.icon} ${def.name.toUpperCase()}!${G.movesDone.length > 1 ? ` ×${G.movesDone.length}` : ''}`;
+  el.trickPop.classList.remove('pop');
+  void el.trickPop.offsetWidth;
+  el.trickPop.classList.add('pop');
+  updateTrickButtons();
+}
+
 function stepAir() {
-  const target = holding ? SPIN * G.trick.speed : 0;
+  const target = holding ? SPIN * G.flipStyle.speed : 0;
   const rate = holding ? 16 : 20;
   G.omega += (target - G.omega) * (1 - Math.exp(-rate * STEP));
-  G.angle += G.omega * STEP;
-  G.vy = Math.max(G.vy - G.phys.gravity * STEP, -G.phys.terminal);
-  G.x += G.vx * STEP;
-  G.y += G.vy * STEP;
-  if (G.y - HIP_HEIGHT <= MAT_TOP && G.vy < 0) {
+  G.angle += G.omega * STEP * G.dir;
+  if (G.move) {
+    G.move.t += STEP;
+    if (G.move.t >= G.move.def.time) finishTrick();
+  }
+  const landed = fallStep(G, G.phys);
+  // coins are checked every step so fast falls can't skip past them
+  for (const c of coins) {
+    if (c.taken) continue;
+    if (Math.hypot(c.mesh.position.x - G.x, c.mesh.position.y - G.y) < 1.25) {
+      c.taken = true;
+      G.airCoins += c.value;
+      addCoins(c.value);
+      sfx.coin();
+      sparkle(c.mesh.position, '#ffe066', 6);
+    }
+  }
+  if (landed) {
     G.y = MAT_TOP + HIP_HEIGHT;
     land();
   }
@@ -322,32 +395,36 @@ function uprightError(angle) {
 function land() {
   const a = uprightError(G.angle);
   setWind(0);
+  hero.setWind(0);
   el.flip.classList.remove('pop');
   el.flip.style.opacity = 0;
+  if (G.move) { crash(a, 'Finish your trick before you land!'); return; }
   if (Math.abs(a) < LAND_TOL) {
-    const flips = Math.max(0, Math.round(G.angle / TAU));
+    const turns = Math.round(G.angle / TAU);
+    const flips = Math.abs(turns);
     const perfect = Math.abs(a) < PERFECT_TOL;
-    G.angleTarget = flips * TAU;
-    G.twistTarget = flips * TAU * G.trick.twist;
+    G.angleTarget = turns * TAU;
+    G.twistTarget = turns * TAU * G.flipStyle.twist + G.extraTwist;
     G.landedFlips = flips;
     setState('landed');
     hero.setPose('crouch', 25);
     sfx.land();
-    if (perfect && flips > 0) setTimeout(() => sfx.perfect(), 120);
+    if (perfect && (flips > 0 || G.movesDone.length)) setTimeout(() => sfx.perfect(), 120);
     dust(G.x, MAT_TOP, 16);
     G.shake = 0.12;
     scoreLanding(flips, perfect);
   } else {
-    crash(a);
+    crash(a, 'Land on your feet!');
   }
 }
 
-function crash(a) {
+function crash(a, why) {
   setState('crashed');
   G.streak = 0;
   const base = G.angle - a;
   G.angleTarget = base + (a > 0 ? Math.PI / 2 : -Math.PI / 2);
-  G.twistTarget = Math.round((G.angle * G.trick.twist) / TAU) * TAU;
+  G.twistTarget = Math.round(hero.twist.rotation.y / TAU) * TAU;
+  G.move = null;
   G.vy = 3.2;
   G.vx *= 0.5;
   G.restY = MAT_TOP + 0.24;
@@ -356,24 +433,34 @@ function crash(a) {
   G.shake = 0.55;
   dust(G.x, MAT_TOP, 26);
   const msgs = ['OUCH!', 'CRASH!', 'BONK!', 'OOF!', 'WIPEOUT!'];
-  const sub = G.airCoins ? `Land on your feet! · +${G.airCoins} coins` : 'Land on your feet!';
+  const sub = G.airCoins ? `${why} · +${G.airCoins} coins` : why;
   toast(`<div class="big bad">${msgs[Math.floor(Math.random() * msgs.length)]}</div><div class="sub">${sub}</div>`);
   updateStreak();
 }
 
-function flipName(flips, trick) {
-  const base = trick.name.toUpperCase();
+function flipName(flips, style) {
+  const base = style.name.toUpperCase();
   if (flips === 1) return base + '!';
   return `${FLIP_NAMES[flips] || flips + 'x'} ${base}!`;
 }
 
+function goalMissing(L, flips, tricks, perfect) {
+  const need = [];
+  if (flips < L.flips) need.push(plural(L.flips, 'flip'));
+  if (tricks < L.tricks) need.push(plural(L.tricks, 'trick'));
+  if (L.perfect && !perfect) need.push('a PERFECT landing');
+  return need;
+}
+
 function scoreLanding(flips, perfect) {
   const L = G.level, i = G.levelIndex;
+  const tricks = G.movesDone.length;
   let earned = 0;
-  if (flips > 0) {
+  if (flips > 0 || tricks > 0) {
     G.streak++;
     const streakMult = 1 + Math.min(G.streak - 1, 10) * 0.1;
-    earned = Math.round(5 * flips * (1 + i * 0.5) * G.trick.mult * (perfect ? 1.5 : 1) * streakMult);
+    const flipCoins = 5 * flips * G.flipStyle.mult;
+    earned = Math.round((flipCoins + G.moveCoins) * levelBonus(i) * (perfect ? 1.5 : 1) * streakMult);
     addCoins(earned);
   } else {
     G.streak = 0;
@@ -381,18 +468,22 @@ function scoreLanding(flips, perfect) {
   updateStreak();
   if (flips > (save.best[i] || 0)) save.best[i] = flips;
 
-  const cleared = flips >= L.req;
+  const need = goalMissing(L, flips, tricks, perfect);
+  const cleared = need.length === 0;
   const firstClear = cleared && !save.cleared[i];
-  let big, subs = [];
-  if (flips === 0) {
-    big = 'NICE LANDING';
-    subs.push('Hold longer to flip!');
-  } else {
-    big = flipName(flips, G.trick);
-    subs.push(`+${earned} coins${G.streak > 1 ? ` · streak x${(1 + Math.min(G.streak - 1, 10) * 0.1).toFixed(1)}` : ''}`);
-  }
-  if (perfect && flips > 0) subs.unshift('<span class="perfect">★ PERFECT LANDING ★</span>');
-  if (!cleared) subs.push(`Need ${L.req} flip${L.req > 1 ? 's' : ''} to clear`);
+  if (cleared && perfect) save.perfect[i] = true;
+
+  let big;
+  if (flips > 0) big = flipName(flips, G.flipStyle);
+  else if (tricks === 1) big = `${byId(TRICKS, G.movesDone[0]).name.toUpperCase()}!`;
+  else if (tricks > 1) big = `${tricks} TRICKS!`;
+  else big = 'NICE LANDING';
+  const subs = [];
+  if (perfect && (flips > 0 || tricks > 0)) subs.push('<span class="perfect">★ PERFECT LANDING ★</span>');
+  if (flips > 0 && tricks > 0) subs.push(`+ ${plural(tricks, 'trick')}`);
+  if (earned) subs.push(`+${earned} coins${G.streak > 1 ? ` · streak x${(1 + Math.min(G.streak - 1, 10) * 0.1).toFixed(1)}` : ''}`);
+  else subs.push('Hold longer to flip!');
+  if (!cleared) subs.push(`Need ${need.join(' + ')}`);
   else if (!firstClear) subs.push('Level cleared ✔');
 
   if (firstClear) {
@@ -402,7 +493,7 @@ function scoreLanding(flips, perfect) {
     addCoins(bonus);
     G.panel = true;
     toast(`<div class="big">${big}</div>`);
-    setTimeout(() => showComplete(flips, earned, bonus), 900);
+    setTimeout(() => showComplete(flips, tricks, earned, bonus), 900);
   } else {
     toast(`<div class="big">${big}</div>${subs.map((s) => `<div class="sub">${s}</div>`).join('')}`);
   }
@@ -411,9 +502,8 @@ function scoreLanding(flips, perfect) {
 }
 
 function starsFor(i) {
-  const best = save.best[i] || 0, req = LEVELS[i].req;
   if (!save.cleared[i]) return 0;
-  return best >= req + 2 ? 3 : best >= req + 1 ? 2 : 1;
+  return 1 + ((save.best[i] || 0) >= LEVELS[i].flips + 1 ? 1 : 0) + (save.perfect[i] ? 1 : 0);
 }
 function starsHtml(n) {
   return [0, 1, 2].map((k) => `<span class="${k < n ? 'on' : 'off'}">★</span>`).join('');
@@ -423,7 +513,7 @@ function addCoins(n) {
   if (!n) return;
   save.coins += n;
   persist();
-  for (const c of document.querySelectorAll('.coin-count, #hud-coins')) c.textContent = save.coins;
+  for (const c of document.querySelectorAll('.coin-count, #hud-coins')) c.textContent = save.coins.toLocaleString();
   for (const p of document.querySelectorAll('.coins-pill')) {
     p.classList.remove('bump');
     void p.offsetWidth;
@@ -435,31 +525,78 @@ function addCoins(n) {
 const $ = (id) => document.getElementById(id);
 const el = {
   hud: $('hud'), level: $('hud-level'), goal: $('hud-goal'), coins: $('hud-coins'),
-  flip: $('flip-counter'), hint: $('hint'), toast: $('toast'), streak: $('streak'),
+  flip: $('flip-counter'), trickPop: $('trick-pop'), hint: $('hint'), hintGoal: $('hint-goal'),
+  toast: $('toast'), streak: $('streak'), tricks: $('trick-buttons'),
   altimeter: $('altimeter'), altMarker: $('alt-marker'), altText: $('alt-text'),
   menu: $('menu'), levels: $('levels'), store: $('store'), complete: $('complete'),
   levelGrid: $('level-grid'), storeGrid: $('store-grid'), storeDesc: $('store-desc'), buy: $('btn-buy'),
-  sound: $('btn-sound'),
+  sound: $('btn-sound'), playLevel: $('play-level'),
 };
 
 function showScreen(name) {
   for (const s of ['menu', 'levels', 'store', 'complete']) el[s].classList.toggle('hidden', s !== name);
   el.hud.classList.toggle('hidden', name !== null && name !== 'complete');
   touchLayer.style.pointerEvents = name === null ? 'auto' : 'none';
-  for (const c of document.querySelectorAll('.coin-count, #hud-coins')) c.textContent = save.coins;
+  refreshCoins();
+  el.playLevel.textContent = `Level ${Math.min(save.level, save.unlocked - 1) + 1} of ${LEVELS.length}`;
+}
+
+function refreshCoins() {
+  for (const c of document.querySelectorAll('.coin-count, #hud-coins')) c.textContent = save.coins.toLocaleString();
+}
+
+function goalChips(L) {
+  let html = `<span class="chip">🔄 ${L.flips}</span>`;
+  if (L.tricks) html += `<span class="chip">✨ ${L.tricks}</span>`;
+  if (L.perfect) html += '<span class="chip gold">🎯 perfect</span>';
+  return html;
+}
+function goalSentence(L) {
+  const parts = [plural(L.flips, 'flip')];
+  if (L.tricks) parts.push(plural(L.tricks, 'button trick'));
+  let s = 'Goal: land ' + parts.join(' + ');
+  if (L.perfect) s += ' with a PERFECT landing';
+  return s;
 }
 
 function updateHud() {
   const L = G.level;
-  el.level.textContent = `Lv ${G.levelIndex + 1} · ${L.name}`;
-  const best = save.best[G.levelIndex] || 0;
-  el.goal.textContent = `🎯 ${L.req} flip${L.req > 1 ? 's' : ''} · ${L.height} m${best ? ` · best ${best}` : ''}`;
-  el.coins.textContent = save.coins;
+  el.level.textContent = `Lv ${G.levelIndex + 1} · ${L.name} · ${L.height.toLocaleString()} m`;
+  el.goal.innerHTML = goalChips(L);
+  el.hintGoal.textContent = goalSentence(L) + (L.tricks ? ' · tap the trick buttons in the air!' : '');
+  refreshCoins();
 }
 
 function updateStreak() {
   el.streak.classList.toggle('hidden', G.streak < 2);
   el.streak.textContent = `🔥 Streak x${G.streak}`;
+}
+
+function renderTrickButtons() {
+  el.tricks.innerHTML = '';
+  save.buttons.forEach((id, slot) => {
+    const def = byId(TRICKS, id);
+    const b = document.createElement('button');
+    b.className = 'trick-btn';
+    b.innerHTML = `<span class="ti">${def.icon}</span><span class="tn">${def.name}</span><span class="tk">${slot + 1}</span>`;
+    b.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      doTrick(slot);
+    });
+    el.tricks.appendChild(b);
+  });
+  updateTrickButtons();
+}
+
+function updateTrickButtons() {
+  const usable = G.state === 'ready' || G.state === 'air';
+  [...el.tricks.children].forEach((b, i) => {
+    const active = !!G.move && G.move.slot === i;
+    b.classList.toggle('active', active);
+    b.classList.toggle('dim', !usable || (!!G.move && !active));
+    if (!active) b.style.setProperty('--p', 0);
+  });
 }
 
 let toastTimer = 0;
@@ -480,16 +617,20 @@ function showFlipCount(n) {
   el.flip.classList.add('pop');
 }
 
-function showComplete(flips, earned, bonus) {
+function showComplete(flips, tricks, earned, bonus) {
   const i = G.levelIndex;
   const last = i === LEVELS.length - 1;
-  $('complete-title').textContent = last ? 'YOU BEAT SKYFLIP!' : 'LEVEL COMPLETE!';
+  $('complete-title').textContent = last ? 'YOU BEAT ALL 100 LEVELS!' : 'LEVEL COMPLETE!';
   $('complete-stars').innerHTML = starsHtml(starsFor(i));
   const next = LEVELS[i + 1];
+  const landed = [plural(flips, 'flip')];
+  if (tricks) landed.push(plural(tricks, 'trick'));
   $('complete-lines').innerHTML = [
-    `${flips} flip${flips > 1 ? 's' : ''} landed · +${earned} coins`,
+    `${landed.join(' + ')} landed · +${earned} coins`,
     `<span class="gold">Clear bonus +${bonus} coins</span>`,
-    next ? `Next: ${next.name} · ${next.height} m tall!` : 'You are a flip legend! 🏆',
+    next
+      ? `Next: ${next.name} · ${next.height.toLocaleString()} m tall!${next.world !== G.level.world ? `<br>🌍 New world: ${WORLDS[next.world].name}!` : ''}`
+      : 'You are a flip legend! 🏆',
   ].join('<br>');
   $('btn-next').classList.toggle('hidden', last);
   showScreen('complete');
@@ -518,15 +659,16 @@ $('btn-play').addEventListener('click', () => {
   sfx.click();
   startLevel(Math.min(save.level, save.unlocked - 1));
 });
-$('btn-levels').addEventListener('click', () => { initAudio(); sfx.click(); renderLevels(); showScreen('levels'); });
+$('btn-levels').addEventListener('click', () => { initAudio(); sfx.click(); showScreen('levels'); renderLevels(); });
 $('btn-store').addEventListener('click', () => { initAudio(); sfx.click(); openStore(); });
 $('btn-pause').addEventListener('click', () => { sfx.click(); goMenu(); });
 for (const b of document.querySelectorAll('[data-back]')) b.addEventListener('click', () => { sfx.click(); goMenu(); });
 
 function goMenu() {
-  if (G.state === 'store') hero.applySkin(skinById(save.skin));
+  if (G.state === 'store') hero.applySkin(byId(SKINS, save.skin));
   dropInput();
   G.panel = false;
+  G.demo.active = false;
   placeOnTower();
   setState('menu');
   showScreen('menu');
@@ -545,31 +687,55 @@ el.sound.addEventListener('click', () => {
 
 function renderLevels() {
   el.levelGrid.innerHTML = '';
-  LEVELS.forEach((L, i) => {
-    const th = THEMES[L.theme];
-    const locked = i >= save.unlocked;
-    const b = document.createElement('button');
-    b.className = 'level-card' + (locked ? ' locked' : '');
-    b.style.setProperty('--c1', th.skyTop);
-    b.style.setProperty('--c2', th.ground);
-    b.innerHTML = `<div class="num">LEVEL ${i + 1}</div><div class="name">${L.name}</div>
-      <div class="meta">${L.height} m · ${L.req} flip${L.req > 1 ? 's' : ''}${L.gravity ? ' · low gravity' : ''}</div>
-      <div class="stars">${starsHtml(starsFor(i))}</div>`;
-    b.addEventListener('click', () => {
-      if (locked) { sfx.nope(); return; }
-      sfx.click();
-      startLevel(i);
-    });
-    el.levelGrid.appendChild(b);
+  let focus = null;
+  WORLDS.forEach((w, wi) => {
+    let stars = 0;
+    for (let k = 0; k < 10; k++) stars += starsFor(wi * 10 + k);
+    const head = document.createElement('div');
+    head.className = 'world-head';
+    head.innerHTML = `<span>World ${wi + 1} · ${w.name}</span><span class="wstars">★ ${stars}/30</span>`;
+    el.levelGrid.appendChild(head);
+    for (let k = 0; k < 10; k++) {
+      const i = wi * 10 + k;
+      const L = LEVELS[i];
+      const th = THEMES[L.theme];
+      const locked = i >= save.unlocked;
+      const b = document.createElement('button');
+      b.className = 'level-card' + (locked ? ' locked' : '') + (i === save.unlocked - 1 ? ' next' : '');
+      b.style.setProperty('--c1', th.skyTop);
+      b.style.setProperty('--c2', th.ground);
+      b.innerHTML = `<div class="num">${i + 1}</div><div class="name">${L.name}</div>
+        <div class="meta">${L.height.toLocaleString()} m${L.gravity && L.gravity < 14 ? ' · 🌙' : ''}</div>
+        <div class="goals">${goalChips(L)}</div>
+        <div class="stars">${starsHtml(starsFor(i))}</div>`;
+      b.addEventListener('click', () => {
+        if (locked) { sfx.nope(); return; }
+        sfx.click();
+        startLevel(i);
+      });
+      el.levelGrid.appendChild(b);
+      if (i === save.unlocked - 1) focus = b;
+    }
   });
+  if (focus) focus.scrollIntoView({ block: 'center' });
 }
 
 // ---------- Store ----------
+const SHOP = {
+  skins: { list: SKINS, owned: () => save.skins },
+  flips: { list: FLIPS, owned: () => save.flips },
+  tricks: { list: TRICKS, owned: () => save.tricks },
+};
 let storeTab = 'skins';
 let storeSel = save.skin;
 
+function equippedId(tab) {
+  return tab === 'skins' ? save.skin : tab === 'flips' ? save.flip : null;
+}
+
 function openStore() {
-  storeSel = storeTab === 'skins' ? save.skin : save.trick;
+  storeSel = storeTab === 'tricks' ? save.buttons[0] : equippedId(storeTab);
+  G.demo.active = false;
   placeOnTower();
   setState('store');
   showScreen('store');
@@ -581,109 +747,148 @@ for (const tab of document.querySelectorAll('.tab')) {
     sfx.click();
     storeTab = tab.dataset.tab;
     for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t === tab);
-    storeSel = storeTab === 'skins' ? save.skin : save.trick;
-    hero.applySkin(skinById(save.skin));
+    storeSel = storeTab === 'tricks' ? save.buttons[0] : equippedId(storeTab);
+    hero.applySkin(byId(SKINS, save.skin));
     renderStore();
+    el.storeGrid.scrollTop = 0;
   });
 }
 
 function renderStore() {
-  const list = storeTab === 'skins' ? SKINS : TRICKS;
-  const owned = storeTab === 'skins' ? save.skins : save.tricks;
-  const equipped = storeTab === 'skins' ? save.skin : save.trick;
+  const { list, owned } = SHOP[storeTab];
   el.storeGrid.innerHTML = '';
   for (const item of list) {
     const b = document.createElement('button');
     b.className = 'item' + (item.id === storeSel ? ' selected' : '');
     const bg = storeTab === 'skins'
       ? `linear-gradient(135deg, ${item.colors.shirt} 50%, ${item.colors.hat} 50%)`
-      : 'linear-gradient(135deg, #f59e0b, #ef4444)';
+      : storeTab === 'flips' ? 'linear-gradient(135deg, #f59e0b, #ef4444)' : 'linear-gradient(135deg, #22d3ee, #6366f1)';
+    const slot = save.buttons.indexOf(item.id);
     let tag;
-    if (item.id === equipped) tag = '<span class="tag eq">EQUIPPED</span>';
-    else if (owned.includes(item.id)) tag = '<span class="tag">OWNED</span>';
-    else tag = `<span class="price"><span class="coin-icon"></span>${item.price}</span>`;
+    if (storeTab === 'tricks' && slot >= 0) tag = `<span class="tag eq">BUTTON ${slot + 1}</span>`;
+    else if (item.id === equippedId(storeTab)) tag = '<span class="tag eq">EQUIPPED</span>';
+    else if (owned().includes(item.id)) tag = '<span class="tag">OWNED</span>';
+    else tag = `<span class="price"><span class="coin-icon"></span>${item.price.toLocaleString()}</span>`;
     b.innerHTML = `<div class="swatch" style="background:${bg}">${item.icon}</div><div class="iname">${item.name}</div>${tag}`;
     b.addEventListener('click', () => {
       sfx.click();
       storeSel = item.id;
       if (storeTab === 'skins') hero.applySkin(item);
-      else startDemo(item);
+      else startDemo(storeTab === 'flips' ? 'flip' : 'trick', item);
       renderStore();
     });
     el.storeGrid.appendChild(b);
+    if (item.id === storeSel) requestAnimationFrame(() => b.scrollIntoView({ block: 'nearest' }));
   }
   updateStoreAction();
 }
 
 function updateStoreAction() {
-  const isSkin = storeTab === 'skins';
-  const item = isSkin ? skinById(storeSel) : trickById(storeSel);
-  const owned = (isSkin ? save.skins : save.tricks).includes(item.id);
-  const equipped = (isSkin ? save.skin : save.trick) === item.id;
-  el.storeDesc.innerHTML = isSkin
-    ? `<b>${item.name}</b><br>${owned ? 'Looking good!' : 'Tap Buy to unlock this skin.'}`
-    : `<b>${item.name}</b> · ${item.mult}x coins<br>${item.desc}`;
+  const { list, owned } = SHOP[storeTab];
+  const item = byId(list, storeSel);
+  const has = owned().includes(item.id);
+  let desc;
+  if (storeTab === 'skins') desc = has ? 'Looking good!' : 'Tap Buy to unlock this skin.';
+  else if (storeTab === 'flips') desc = `${item.mult}x coins · ${item.desc}`;
+  else desc = `${item.time}s · +${item.coins} coins · ${item.desc}`;
+  el.storeDesc.innerHTML = `<b>${item.name}</b><br>${desc}`;
   el.buy.disabled = false;
-  if (equipped) { el.buy.textContent = 'Equipped ✔'; el.buy.disabled = true; }
-  else if (owned) el.buy.textContent = 'Equip';
-  else if (save.coins >= item.price) el.buy.textContent = `Buy · ${item.price}`;
-  else { el.buy.textContent = `Need ${item.price - save.coins}`; el.buy.disabled = true; }
+  if (!has) {
+    if (save.coins >= item.price) el.buy.textContent = `Buy · ${item.price.toLocaleString()}`;
+    else { el.buy.textContent = `Need ${(item.price - save.coins).toLocaleString()}`; el.buy.disabled = true; }
+  } else if (storeTab === 'tricks') {
+    const on = save.buttons.includes(item.id);
+    el.buy.textContent = on ? 'Remove button' : 'Add button';
+    el.buy.disabled = on && save.buttons.length === 1;
+  } else if (item.id === equippedId(storeTab)) {
+    el.buy.textContent = 'Equipped ✔';
+    el.buy.disabled = true;
+  } else {
+    el.buy.textContent = 'Equip';
+  }
 }
 
 el.buy.addEventListener('click', () => {
-  const isSkin = storeTab === 'skins';
-  const item = isSkin ? skinById(storeSel) : trickById(storeSel);
-  const ownedList = isSkin ? save.skins : save.tricks;
-  if (!ownedList.includes(item.id)) {
+  const { list, owned } = SHOP[storeTab];
+  const item = byId(list, storeSel);
+  if (!owned().includes(item.id)) {
     if (save.coins < item.price) { sfx.nope(); return; }
     addCoins(-item.price);
-    ownedList.push(item.id);
+    owned().push(item.id);
     sfx.buy();
     confetti(START_X, G.level.height + 1.5);
+    if (storeTab === 'tricks') {
+      // new tricks go straight onto a button (replacing the oldest if all 4 are used)
+      if (save.buttons.length >= MAX_BUTTONS) save.buttons.shift();
+      save.buttons.push(item.id);
+    }
+  } else if (storeTab === 'tricks') {
+    sfx.click();
+    const at = save.buttons.indexOf(item.id);
+    if (at >= 0) {
+      if (save.buttons.length > 1) save.buttons.splice(at, 1);
+    } else {
+      if (save.buttons.length >= MAX_BUTTONS) save.buttons.shift();
+      save.buttons.push(item.id);
+    }
   } else {
     sfx.click();
   }
-  if (isSkin) save.skin = item.id; else save.trick = item.id;
+  if (storeTab === 'skins') save.skin = item.id;
+  if (storeTab === 'flips') save.flip = item.id;
   persist();
+  renderTrickButtons();
   renderStore();
 });
 
-function startDemo(trick) {
-  G.demo.active = true;
-  G.demo.t = 0;
-  G.demo.trick = trick;
-  G.demo.dur = 0.95 / trick.speed;
+function startDemo(kind, item) {
+  G.demo = { active: true, t: 0, kind, item, dur: kind === 'flip' ? 0.95 / item.speed : item.time + 0.45 };
 }
 
 // ---------- Main loop ----------
 function smooth(k, dt) { return 1 - Math.exp(-k * dt); }
 
+function updateDemo(dt) {
+  if (G.state === 'menu') {
+    G.demoTimer += dt;
+    if (G.demoTimer > 3.2 && !G.demo.active) {
+      G.demoTimer = 0;
+      if (Math.random() < 0.5) startDemo('trick', byId(TRICKS, save.buttons[Math.floor(Math.random() * save.buttons.length)]));
+      else startDemo('flip', byId(FLIPS, save.flip));
+    }
+  }
+  let hop = 0;
+  const d = G.demo;
+  if (d.active) {
+    d.t += dt;
+    const p = Math.min(1, d.t / d.dur);
+    hop = Math.sin(p * Math.PI) * (G.state === 'store' ? 0.8 : 1.3);
+    if (d.kind === 'flip') {
+      G.angle = ease(p) * TAU * (d.item.dir || 1);
+      hero.setPose(p < 0.12 ? 'launch' : p < 0.8 ? d.item.pose : 'stand', 16);
+      hero.twist.rotation.y = G.angle * d.item.twist;
+    } else {
+      const tt = d.t - 0.2;
+      G.angle = 0;
+      if (tt > 0 && tt < d.item.time) {
+        hero.setPoseTo(trickPose(d.item.id, tt), 22);
+        hero.twist.rotation.y = (d.item.turns || 0) * TAU * ease(tt / d.item.time);
+      } else {
+        hero.setPose(tt <= 0 ? 'launch' : 'stand', 16);
+      }
+    }
+    if (p >= 1) { d.active = false; G.angle = 0; hero.twist.rotation.y = 0; }
+  } else {
+    hero.setPose('stand', 8);
+  }
+  G.x = START_X;
+  G.y = G.level.height + HIP_HEIGHT + hop;
+}
+
 function update(dt) {
   const top = G.level.height;
 
-  // Menu & store: idle on the tower, show off tricks now and then
-  if (G.state === 'menu' || G.state === 'store') {
-    if (G.state === 'menu') {
-      G.demoTimer += dt;
-      if (G.demoTimer > 3.2 && !G.demo.active) { G.demoTimer = 0; startDemo(trickById(save.trick)); }
-    }
-    let hop = 0;
-    if (G.demo.active) {
-      const d = G.demo;
-      d.t += dt;
-      const p = Math.min(1, d.t / d.dur);
-      const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
-      hop = Math.sin(p * Math.PI) * (G.state === 'store' ? 0.8 : 1.3);
-      G.angle = e * TAU;
-      hero.setPose(p < 0.12 ? 'launch' : p < 0.8 ? d.trick.pose : 'stand', 16);
-      hero.twist.rotation.y = G.angle * d.trick.twist;
-      if (p >= 1) { d.active = false; G.angle = 0; hero.twist.rotation.y = 0; }
-    } else {
-      hero.setPose('stand', 8);
-    }
-    G.x = START_X;
-    G.y = top + HIP_HEIGHT + hop;
-  }
+  if (G.state === 'menu' || G.state === 'store') updateDemo(dt);
 
   if (G.state === 'intro' && G.stateTime >= G.introDur) setState('ready');
 
@@ -693,16 +898,19 @@ function update(dt) {
   }
 
   if (G.state === 'air') {
-    // pose follows the button: tuck while holding, open up to land
     const height = G.y - HIP_HEIGHT - MAT_TOP;
-    const timeToLand = height / Math.max(1, -G.vy);
-    if (holding && G.stateTime > 0.06) hero.setPose(G.trick.pose, 16);
+    const fall = Math.max(0, -G.vy);
+    const timeToLand = height / Math.max(1, fall);
+    if (G.move) hero.setPoseTo(trickPose(G.move.def.id, G.move.t), 22);
+    else if (holding && G.stateTime > 0.06) hero.setPose(G.flipStyle.pose, 16);
     else if (G.vy > 0) hero.setPose('launch', 12);
     else if (timeToLand < 0.45) hero.setPose('stand', 14);
     else hero.setPose('flail', 8);
-    hero.twist.rotation.y = G.angle * G.trick.twist;
+    const partial = G.move ? (G.move.def.turns || 0) * TAU * ease(Math.min(1, G.move.t / G.move.def.time)) : 0;
+    hero.twist.rotation.y = G.angle * G.flipStyle.twist + G.extraTwist + partial;
+    if (G.move) el.tricks.children[G.move.slot]?.style.setProperty('--p', Math.min(1, G.move.t / G.move.def.time));
 
-    const done = Math.floor((G.angle + 0.35) / TAU);
+    const done = Math.floor((Math.abs(G.angle) + 0.35) / TAU);
     if (done > G.flipsShown) {
       G.flipsShown = done;
       showFlipCount(done);
@@ -713,32 +921,21 @@ function update(dt) {
     G.trailTimer -= dt;
     if (G.omega > 4 && G.trailTimer <= 0) {
       G.trailTimer = 0.018;
-      const tc = skinById(save.skin).colors.trail;
+      const tc = byId(SKINS, save.skin).colors.trail;
       const color = tc === 'rainbow' ? new THREE.Color().setHSL((G.t * 0.8) % 1, 0.9, 0.6) : tc;
       for (const f of hero.feet) {
         f.getWorldPosition(tmpV);
         emit(tmpV, color, { spread: 0.2, life: 0.45, size: 0.9 });
       }
     }
-
-    // coins
-    for (const c of coins) {
-      if (c.taken) continue;
-      if (Math.hypot(c.mesh.position.x - G.x, c.mesh.position.y - G.y) < 1.25) {
-        c.taken = true;
-        G.airCoins += c.value;
-        addCoins(c.value);
-        sfx.coin();
-        for (let k = 0; k < 6; k++) emit(c.mesh.position, '#ffe066', { spread: 3, life: 0.4, size: 0.7 });
-      }
-    }
-    setWind(Math.max(0, -G.vy) / 22);
+    setWind(fall / 45);
+    hero.setWind(Math.min(1, fall / 30));
   }
 
   if (G.state === 'landed') {
     G.angle += (G.angleTarget - G.angle) * smooth(20, dt);
     hero.twist.rotation.y += (G.twistTarget - hero.twist.rotation.y) * smooth(20, dt);
-    if (G.stateTime > 0.22) hero.setPose(G.landedFlips > 0 ? 'cheer' : 'stand', 10);
+    if (G.stateTime > 0.22) hero.setPose(G.landedFlips > 0 || G.movesDone.length ? 'cheer' : 'stand', 10);
     if (G.stateTime > 1.9 && !G.panel) nextAttempt();
   }
 
@@ -785,7 +982,7 @@ function update(dt) {
   if (G.state === 'ready' || G.state === 'air') {
     const h = Math.max(0, G.y - HIP_HEIGHT - MAT_TOP);
     el.altMarker.style.top = `${(1 - Math.min(1, h / Math.max(1, top))) * 100}%`;
-    el.altText.textContent = `${Math.round(h)} m`;
+    el.altText.textContent = `${Math.round(h).toLocaleString()} m`;
   }
 
   updateParticles(dt);
@@ -799,6 +996,7 @@ function updateCamera(dt) {
   const readyLook = new THREE.Vector3(START_X + 1.6, top + 0.3, 0);
   const readyPos = new THREE.Vector3(START_X + 2.6, top + 2.4, base);
   let rate = 3.5;
+  let lockY = false;
 
   switch (G.state) {
     case 'menu': {
@@ -829,12 +1027,14 @@ function updateCamera(dt) {
       rate = 3.2;
       break;
     case 'air': {
+      // follow exactly up and down (falls can reach 180 m/s), ease sideways
       const fall = Math.max(0, -G.vy);
-      const ahead = Math.min(fall * 0.18, 4);
-      const dist = base + Math.min(fall, 30) * 0.22;
+      const ahead = Math.min(fall * 0.12, 5);
+      const dist = base + Math.min(fall, 40) * 0.18;
       wantLook.set(G.x + 1.0, G.y - ahead, 0);
       wantPos.set(G.x + 1.8, G.y + 1.2, dist);
       rate = 10;
+      lockY = true;
       break;
     }
     default: // landed / crashed
@@ -846,6 +1046,10 @@ function updateCamera(dt) {
     const k = smooth(rate, dt);
     camPos.lerp(wantPos, k);
     camLook.lerp(wantLook, k);
+  }
+  if (lockY) {
+    camPos.y = wantPos.y;
+    camLook.y = wantLook.y;
   }
   camera.position.copy(camPos);
   if (G.shake > 0.001) {
@@ -870,6 +1074,7 @@ function frame(now) {
 window.__skyflip = G; // handy for debugging in the browser console
 
 // ---------- Boot ----------
+renderTrickButtons();
 startLevel(Math.min(save.level, save.unlocked - 1), { intro: false });
 setState('menu');
 showScreen('menu');

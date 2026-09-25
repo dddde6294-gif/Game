@@ -1,9 +1,9 @@
 // Offline support: always try the network first (so updates show up right away),
 // fall back to the cached copy when there is no connection.
-const CACHE = 'skyflip-v1';
+const CACHE = 'skyflip-v2';
 const ASSETS = [
   './', './index.html', './style.css', './manifest.webmanifest',
-  './js/main.js', './js/data.js', './js/character.js', './js/world.js', './js/audio.js',
+  './js/main.js', './js/data.js', './js/levels.js', './js/physics.js', './js/character.js', './js/world.js', './js/audio.js',
   './vendor/three.module.min.js',
   './icons/icon.svg', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png',
 ];

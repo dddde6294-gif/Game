@@ -41,8 +41,10 @@
       <div id="alt-text">0 m</div>
     </div>
     <div id="flip-counter"></div>
-    <div id="hint">Hold to jump &amp; flip!<small>Let go to stop spinning · land on your feet</small></div>
+    <div id="trick-pop"></div>
+    <div id="hint">Hold to jump &amp; flip!<small>Let go to stop spinning · land on your feet</small><small id="hint-goal"></small></div>
     <div id="toast"></div>
+    <div id="trick-buttons"></div>
   </div>
 
   <!-- Main menu -->
@@ -57,7 +59,7 @@
     </div>
     <div class="menu-bottom">
       <div class="menu-buttons">
-        <button id="btn-play" class="big-btn play">▶ PLAY</button>
+        <button id="btn-play" class="big-btn play">▶ PLAY<small id="play-level">Level 1 of 100</small></button>
         <div class="row">
           <button id="btn-levels" class="big-btn blue">🗼 Levels</button>
           <button id="btn-store" class="big-btn purple">🛒 Store</button>
@@ -87,6 +89,7 @@
     <div class="store-panel">
       <div class="tabs">
         <button class="tab active" data-tab="skins">Skins</button>
+        <button class="tab" data-tab="flips">Flips</button>
         <button class="tab" data-tab="tricks">Tricks</button>
       </div>
       <div id="store-grid" class="grid store-grid"></div>

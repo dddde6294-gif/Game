@@ -97,5 +97,12 @@ export const sfx = {
   crash() { noise(0.45, { vol: 0.5, freq: 300 }); tone(180, 0.4, { type: 'sawtooth', vol: 0.12, slide: 50 }); },
   buy() { tone(784, 0.08, { type: 'square', vol: 0.08 }); tone(1175, 0.08, { type: 'square', vol: 0.08, delay: 0.08 }); tone(1568, 0.25, { type: 'square', vol: 0.08, delay: 0.16 }); },
   nope() { tone(200, 0.15, { type: 'square', vol: 0.08 }); tone(150, 0.2, { type: 'square', vol: 0.08, delay: 0.12 }); },
+  trick() { noise(0.18, { vol: 0.18, freq: 2200, type: 'bandpass', q: 0.8 }); tone(520, 0.12, { type: 'triangle', vol: 0.08, slide: 880 }); },
+  trickDone(n) {
+    const base = 660 * Math.pow(2, Math.min(n, 8) / 12 * 2);
+    tone(base, 0.1, { type: 'square', vol: 0.07 });
+    tone(base * 1.25, 0.1, { type: 'square', vol: 0.07, delay: 0.06 });
+    tone(base * 1.5, 0.16, { type: 'square', vol: 0.07, delay: 0.12 });
+  },
   win() { [523, 659, 784, 659, 784, 1047].forEach((f, i) => tone(f, 0.22, { type: 'square', vol: 0.07, delay: i * 0.1 })); },
 };

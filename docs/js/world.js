@@ -1,7 +1,8 @@
 import * as THREE from '../vendor/three.module.min.js';
+import { MAT_TOP } from './physics.js';
 
-export const MAT_TOP = 0.35;       // landing mat surface height
 const MAT_SIZE = 3.4;
+const SPACE_BLACK = new THREE.Color('#02030a');
 
 function rng(seed) {
   // mulberry32: small seeded random so each level always looks the same
@@ -119,6 +120,26 @@ function makeSky() {
   return sky;
 }
 
+// Collects lots of copies of one shape and draws them all at once (fast on phones).
+class Batch {
+  constructor() { this.items = []; }
+  add(x, y, z, sx, sy = sx, sz = sx, ry = 0) { this.items.push([x, y, z, sx, sy, sz, ry]); }
+  build(geometry, material) {
+    const mesh = new THREE.InstancedMesh(geometry, material, Math.max(1, this.items.length));
+    const o = new THREE.Object3D();
+    this.items.forEach(([x, y, z, sx, sy, sz, ry], i) => {
+      o.position.set(x, y, z);
+      o.scale.set(sx, sy, sz);
+      o.rotation.set(0, ry, 0);
+      o.updateMatrix();
+      mesh.setMatrixAt(i, o.matrix);
+    });
+    mesh.count = this.items.length;
+    mesh.computeBoundingSphere();
+    return mesh;
+  }
+}
+
 export class World {
   constructor(scene) {
     this.scene = scene;
@@ -133,13 +154,16 @@ export class World {
     scene.add(this.skyGroup);
 
     this.group = null;
+    this.skyExtras = [];
     this.dynamic = [];
+    this.skyTop = new THREE.Color();
+    this.stars = null;
+    this.starsAlways = false;
+    this.altitudeSky = false;
   }
 
   clear() {
-    if (!this.group) return;
-    this.scene.remove(this.group);
-    this.group.traverse((o) => {
+    const dispose = (o) => {
       if (o.geometry) o.geometry.dispose();
       if (o.material) {
         for (const m of [].concat(o.material)) {
@@ -148,10 +172,19 @@ export class World {
           m.dispose();
         }
       }
-    });
-    for (const o of this.skyExtras || []) this.skyGroup.remove(o);
+    };
+    if (this.group) {
+      this.scene.remove(this.group);
+      this.group.traverse(dispose);
+    }
+    for (const o of this.skyExtras) {
+      this.skyGroup.remove(o);
+      o.traverse(dispose);
+    }
     this.group = null;
+    this.skyExtras = [];
     this.dynamic = [];
+    this.stars = null;
   }
 
   // Builds the level. `landX` is where the jump will land (mat center).
@@ -161,29 +194,35 @@ export class World {
     const H = level.height;
     const G = new THREE.Group();
     this.group = G;
-    this.skyExtras = [];
     this.scene.add(G);
 
     // Sky, fog and lights
+    const fogFar = 320 + H * 1.5;
+    this.skyTop.set(theme.skyTop);
     this.sky.material.uniforms.top.value.set(theme.skyTop);
     this.sky.material.uniforms.bottom.value.set(theme.skyBottom);
-    this.scene.fog = new THREE.Fog(theme.skyBottom, 40 + H * 0.3, 320 + H * 1.5);
+    this.scene.fog = new THREE.Fog(theme.skyBottom, 40 + H * 0.3, fogFar);
     this.hemi.color.set(theme.skyTop).lerp(new THREE.Color('#ffffff'), 0.6);
     this.hemi.groundColor.set(theme.ground).multiplyScalar(0.6);
     this.hemi.intensity = 1.1 * theme.sun + 0.35;
     this.sun.intensity = 1.9 * theme.sun;
 
-    if (theme.stars) {
+    // Very tall towers reach so high that the sky turns dark and starry.
+    this.altitudeSky = H > 400;
+    this.starsAlways = !!theme.stars;
+    if (theme.stars || this.altitudeSky) {
       const pts = [];
-      for (let i = 0; i < 700; i++) {
+      for (let i = 0; i < 800; i++) {
         const a = rand() * Math.PI * 2, y = 0.05 + rand() * 0.95, r = Math.sqrt(1 - y * y);
         pts.push(Math.cos(a) * r * 900, y * 900, Math.sin(a) * r * 900);
       }
       const geo = new THREE.BufferGeometry();
       geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
-      const stars = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 2, sizeAttenuation: false, fog: false }));
-      this.skyGroup.add(stars);
-      this.skyExtras.push(stars);
+      this.stars = new THREE.Points(geo, new THREE.PointsMaterial({
+        color: 0xffffff, size: 2, sizeAttenuation: false, fog: false, transparent: true, opacity: theme.stars ? 1 : 0,
+      }));
+      this.skyGroup.add(this.stars);
+      this.skyExtras.push(this.stars);
     }
     if (theme.earth) {
       const earth = new THREE.Mesh(new THREE.SphereGeometry(70, 32, 24),
@@ -197,9 +236,10 @@ export class World {
     }
 
     // Ground
+    const size = Math.max(2400, H * 5);
     const gTex = groundTexture(theme.ground, rand);
-    gTex.repeat.set(160, 160);
-    const ground = new THREE.Mesh(new THREE.PlaneGeometry(2400, 2400),
+    gTex.repeat.set(size / 15, size / 15);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(size, size),
       new THREE.MeshStandardMaterial({ map: gTex, roughness: 1 }));
     ground.rotation.x = -Math.PI / 2;
     G.add(ground);
@@ -244,41 +284,62 @@ export class World {
     G.add(mat);
 
     this.buildDeco(theme, H, landX, rand, G);
-    return { towerTop: H, matX: landX, matHalf: MAT_SIZE / 2, towerWidth: W };
+    return { towerTop: H, matX: landX, matHalf: MAT_SIZE / 2, towerWidth: W, viewDistance: fogFar + 400 };
   }
 
   buildDeco(theme, H, landX, rand, G) {
     const std = (color, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.9, flatShading: true, ...extra });
     const place = (mesh, x, z, y = 0) => { mesh.position.set(x, y, z); G.add(mesh); return mesh; };
-    // pick a spot behind the play area (z < -6) or far to the sides
-    const spot = () => {
-      const x = -60 + rand() * (landX + 120);
-      const z = -8 - rand() * 90;
-      return [x, z];
-    };
+    // pick a spot behind the play area (z < -8)
+    const spot = () => [-60 + rand() * (landX + 120), -8 - rand() * 90];
 
     const deco = theme.deco;
-    const count = 55;
-    const cloudMat = (color, opacity) => new THREE.MeshStandardMaterial({ color, roughness: 1, flatShading: true, transparent: opacity < 1, opacity, emissive: color, emissiveIntensity: 0.25 });
-    const groundCloud = cloudMat('#ffffff', 1);
-    const trunk = std('#7a4a26'), leaf = std(shade(theme.ground, -0.12)), leaf2 = std(shade(theme.ground, 0.05));
+    const trunk = std('#7a4a26');
+    const leaf = std(shade(theme.ground, -0.12));
+    const leaf2 = std(shade(theme.ground, 0.05));
+    const palmLeaf = std('#2f9e44');
+    const cloudPuffs = new Batch();
+    const addCloud = (x, y, z, scale) => {
+      const n = 3 + Math.floor(rand() * 3);
+      for (let i = 0; i < n; i++) {
+        cloudPuffs.add(x + (i - n / 2) * 1.1 * scale, y + rand() * 0.4 * scale, z + (rand() - 0.5) * scale, (0.9 + rand() * 0.8) * scale);
+      }
+    };
+    const palm = (x, z, hgt, leafMat) => {
+      place(new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, hgt, 6), trunk), x, z, hgt / 2);
+      for (let k = 0; k < 5; k++) {
+        place(new THREE.Mesh(new THREE.ConeGeometry(0.5, 2.6, 4), leafMat), x, z, hgt).rotation.set(Math.PI / 2 - 0.5, (k / 5) * Math.PI * 2, 0, 'YXZ');
+      }
+    };
 
-    for (let i = 0; i < count; i++) {
+    if (deco === 'palms') {
+      // the sea behind the beach
+      const sea = new THREE.Mesh(new THREE.PlaneGeometry(6000, 3000),
+        new THREE.MeshStandardMaterial({ color: '#1592c9', roughness: 0.3, emissive: '#0b4f73', emissiveIntensity: 0.25, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+      sea.rotation.x = -Math.PI / 2;
+      sea.position.set(0, 0.3, -1560);
+      G.add(sea);
+    }
+
+    for (let i = 0; i < 55; i++) {
       const [x, z] = spot();
       const s = 0.7 + rand() * 1.1;
       if (deco === 'trees' || (deco === 'jungle' && i % 2)) {
         place(new THREE.Mesh(new THREE.CylinderGeometry(0.25 * s, 0.35 * s, 2.2 * s, 6), trunk), x, z, 1.1 * s);
-        const l = place(new THREE.Mesh(new THREE.IcosahedronGeometry(1.6 * s, 0), rand() < 0.5 ? leaf : leaf2), x, z, 2.9 * s);
-        l.rotation.set(rand(), rand(), rand());
+        place(new THREE.Mesh(new THREE.IcosahedronGeometry(1.6 * s, 0), rand() < 0.5 ? leaf : leaf2), x, z, 2.9 * s).rotation.set(rand(), rand(), rand());
       } else if (deco === 'jungle') {
-        const hgt = 4 + rand() * 5;
-        place(new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, hgt, 6), trunk), x, z, hgt / 2);
-        for (let k = 0; k < 5; k++) {
-          const frond = place(new THREE.Mesh(new THREE.ConeGeometry(0.5, 2.6, 4), leaf2), x, z, hgt);
-          frond.rotation.set(Math.PI / 2 - 0.5, (k / 5) * Math.PI * 2, 0, 'YXZ');
+        palm(x, z, 4 + rand() * 5, leaf2);
+      } else if (deco === 'palms') {
+        const bz = -8 - rand() * 45; // stay on the sand, in front of the sea
+        if (i % 4 === 0) {
+          // beach umbrella
+          place(new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 2.2, 6), std('#e5e7eb')), x, bz, 1.1);
+          place(new THREE.Mesh(new THREE.ConeGeometry(1.3, 0.6, 8), std(['#ef4444', '#f59e0b', '#3b82f6', '#ec4899'][i % 4])), x, bz, 2.3);
+        } else {
+          palm(x, bz, 3.5 + rand() * 4, palmLeaf);
         }
       } else if (deco === 'buildings') {
-        const bw = 4 + rand() * 6, bh = 8 + rand() * (20 + H * 0.8), bd = 4 + rand() * 6;
+        const bw = 4 + rand() * 6, bh = 8 + rand() * (20 + Math.min(H, 600) * 0.8), bd = 4 + rand() * 6;
         const tex = towerTexture({ ...theme, tower: shade(theme.tower, (rand() - 0.5) * 0.15) }, rand);
         tex.repeat.set(bw / 4, bh / 4);
         const m = std('#ffffff', { map: tex, flatShading: false });
@@ -295,18 +356,16 @@ export class World {
           crater.scale.z = 0.4;
         }
         if (deco === 'volcano' && i % 4 === 0) {
-          const pool = place(new THREE.Mesh(new THREE.CircleGeometry(1.5 * s, 16),
-            new THREE.MeshBasicMaterial({ color: '#ff5a00' })), x + 2, z, 0.03);
+          const pool = place(new THREE.Mesh(new THREE.CircleGeometry(1.5 * s, 16), new THREE.MeshBasicMaterial({ color: '#ff5a00' })), x + 2, z, 0.03);
           pool.rotation.x = -Math.PI / 2;
         }
       } else if (deco === 'pines') {
-        const snowy = theme.ground === '#f4f8fb' || theme.ground === '#dfe9f2';
         place(new THREE.Mesh(new THREE.CylinderGeometry(0.2 * s, 0.25 * s, 1.2 * s, 6), trunk), x, z, 0.6 * s);
         for (let k = 0; k < 3; k++) {
-          place(new THREE.Mesh(new THREE.ConeGeometry((1.5 - k * 0.35) * s, 1.8 * s, 7), std(k === 2 && snowy ? '#ffffff' : '#1f5f3a')), x, z, (1.6 + k * 1.0) * s);
+          place(new THREE.Mesh(new THREE.ConeGeometry((1.5 - k * 0.35) * s, 1.8 * s, 7), std(k === 2 && theme.snowy ? '#ffffff' : '#1f5f3a')), x, z, (1.6 + k * 1.0) * s);
         }
       } else if (deco === 'clouds') {
-        this.cloud(G, x, z, groundCloud, rand, 1.4 * s);
+        addCloud(x, 1.4 * s, z, 1.4 * s);
       }
     }
 
@@ -318,52 +377,38 @@ export class World {
       m.position.set(-300 + i * 90 + rand() * 40, mh / 2 - 2, -280 - rand() * 150);
       m.rotation.y = rand() * Math.PI;
       G.add(m);
-      if (theme.deco === 'volcano' && i % 3 === 1) {
+      if (deco === 'volcano' && i % 3 === 1) {
         const glow = new THREE.Mesh(new THREE.SphereGeometry(mh * 0.12, 10, 8), new THREE.MeshBasicMaterial({ color: '#ff6a00', fog: false }));
         glow.position.set(m.position.x, mh - 4, m.position.z);
         G.add(glow);
       }
     }
 
-    // Floating clouds / rocks at altitude so falls feel fast
-    const floaters = Math.min(70, 6 + Math.floor(H / 3));
-    const skyCloud = cloudMat(theme.stars ? shade(theme.skyBottom, 0.1) : '#ffffff', 0.92);
+    // Floating clouds (or space rocks) all the way up, so falls feel fast
+    const floaters = Math.min(220, 8 + Math.floor(H / 4));
+    const rocks = new Batch();
     for (let i = 0; i < floaters; i++) {
-      const y = 6 + rand() * (H + 25);
+      const y = 6 + rand() * (H + 40);
       const x = -30 + rand() * (landX + 70);
-      const near = rand() < 0.35;
-      const z = near ? -6 - rand() * 6 : -14 - rand() * 50;
-      if (theme.deco === 'craters') {
-        const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(0.5 + rand() * 1.5, 0), std('#8a8a8a'));
-        rock.position.set(x, y, z);
-        rock.rotation.set(rand() * 3, rand() * 3, 0);
-        const spin = (rand() - 0.5) * 0.6;
-        G.add(rock);
-        this.dynamic.push((t, dt) => { rock.rotation.y += spin * dt; });
-      } else {
-        const c = this.cloud(G, x, z, skyCloud, rand, 1 + rand() * 1.8, y);
-        const drift = 0.3 + rand() * 0.6;
-        const x0 = c.position.x;
-        this.dynamic.push((t) => { c.position.x = x0 + Math.sin(t * 0.05 * drift + x0) * 4; });
-      }
+      const z = rand() < 0.35 ? -6 - rand() * 6 : -14 - rand() * 50;
+      if (deco === 'craters') rocks.add(x, y, z, 0.5 + rand() * 1.5, 0.5 + rand() * 1.5, 0.5 + rand() * 1.5, rand() * 6);
+      else addCloud(x, y, z, 1 + rand() * 1.8);
     }
-  }
-
-  cloud(G, x, z, mat, rand, scale, y = 0) {
-    const c = new THREE.Group();
-    const puffs = 3 + Math.floor(rand() * 3);
-    for (let i = 0; i < puffs; i++) {
-      const p = new THREE.Mesh(new THREE.IcosahedronGeometry((0.9 + rand() * 0.8) * scale, 1), mat);
-      p.position.set((i - puffs / 2) * 1.1 * scale, rand() * 0.4 * scale, (rand() - 0.5) * scale);
-      c.add(p);
+    if (cloudPuffs.items.length) {
+      const color = theme.stars && deco !== 'clouds' ? shade(theme.skyBottom, 0.12) : '#ffffff';
+      G.add(cloudPuffs.build(new THREE.IcosahedronGeometry(1, 1), std(color, { roughness: 1, emissive: color, emissiveIntensity: 0.25 })));
     }
-    c.position.set(x, y || scale, z);
-    G.add(c);
-    return c;
+    if (rocks.items.length) G.add(rocks.build(new THREE.DodecahedronGeometry(1, 0), std('#8a8a8a')));
   }
 
   update(t, dt, camera) {
     this.skyGroup.position.copy(camera.position);
+    if (this.altitudeSky) {
+      // higher up = darker sky with stars, like the edge of space
+      const f = THREE.MathUtils.smoothstep(camera.position.y, 150, 1300);
+      this.sky.material.uniforms.top.value.copy(this.skyTop).lerp(SPACE_BLACK, f * 0.95);
+      if (this.stars && !this.starsAlways) this.stars.material.opacity = f;
+    }
     for (const f of this.dynamic) f(t, dt);
   }
 }
